@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Video Subtitle OCR Pipeline
-- Download YouTube video via yt-dlp
+- Download YouTube video (video + audio) via yt-dlp
 - Extract frames with OpenCV (no FFmpeg / sudo needed)
 - Crop subtitle region (bottom 28%)
 - Deduplicate frames via perceptual hash
 - OCR with Qwen 2.5 VL via vLLM (OpenAI-compatible API)
-- Output JSON with timestamp + text segments
+- Extract audio clips per segment with pydub
+- Output JSON with timestamp + text + audio_file segments
 """
 
 import os
@@ -26,6 +27,7 @@ import cv2
 import requests
 from PIL import Image
 import imagehash
+from pydub import AudioSegment
 
 # ---------------------------------------------------------------------------
 # Config
@@ -61,7 +63,8 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Frame:
-    timestamp: float          # seconds
+    timestamp: float          # seconds (for display/JSON)
+    frame_index: int          # source frame number in original video
     path: Path
     crop_path: Optional[Path] = None
     text: str = ""
@@ -69,9 +72,12 @@ class Frame:
 
 @dataclass
 class Segment:
-    start: float
+    start: float              # seconds (for display/JSON)
     end: float
+    start_frame: int          # exact source frame index
+    end_frame: int
     text: str
+    audio_path: Optional[Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -79,18 +85,19 @@ class Segment:
 # ---------------------------------------------------------------------------
 
 def download_video(url: str, output_dir: Path) -> Path:
-    """Download best video (no audio needed) via yt-dlp."""
+    """Download best video with audio via yt-dlp."""
     log.info("Downloading video: %s", url)
+    output_dir.mkdir(parents=True, exist_ok=True)
     out_template = str(output_dir / "video.%(ext)s")
     cmd = [
         "yt-dlp",
-        "--format", "bestvideo[ext=mp4]/bestvideo/best",
+        "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
         "--output", out_template,
         "--no-playlist",
         url,
     ]
     subprocess.run(cmd, check=True)
-    # Find downloaded file
     candidates = list(output_dir.glob("video.*"))
     if not candidates:
         raise FileNotFoundError("yt-dlp did not produce a video file")
@@ -103,11 +110,10 @@ def download_video(url: str, output_dir: Path) -> Path:
 # Step 2 – Extract frames with OpenCV (no FFmpeg / sudo needed)
 # ---------------------------------------------------------------------------
 
-def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS) -> list[Frame]:
+def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS) -> tuple[list[Frame], float]:
     """
     Extract frames at the given FPS using OpenCV.
-    Saves each sampled frame as JPEG and returns a list of Frame objects
-    with accurate timestamps derived from the video's own PTS.
+    Returns (list of Frame objects, video_fps) — video_fps needed for precise audio cutting.
     """
     frames_dir.mkdir(parents=True, exist_ok=True)
     log.info("Extracting frames at %.2f fps via OpenCV ...", fps)
@@ -121,7 +127,6 @@ def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS)
     duration = total_frames / video_fps
     log.info("Video: %.1fs, %.2f fps, %d total frames", duration, video_fps, total_frames)
 
-    # How many source frames to skip between each sample
     frame_interval = max(1, round(video_fps / fps))
 
     frames: list[Frame] = []
@@ -134,24 +139,23 @@ def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS)
             break
 
         if frame_idx % frame_interval == 0:
-            # Use actual PTS-based timestamp for accuracy
             timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             timestamp = round(timestamp_ms / 1000.0, 3)
 
             out_path = frames_dir / f"frame_{saved:06d}.jpg"
-            # OpenCV reads BGR; convert to RGB for PIL compatibility
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
             pil_img.save(out_path, "JPEG", quality=92)
 
-            frames.append(Frame(timestamp=timestamp, path=out_path))
+            # Store actual source frame index for precise audio cutting
+            frames.append(Frame(timestamp=timestamp, frame_index=frame_idx, path=out_path))
             saved += 1
 
         frame_idx += 1
 
     cap.release()
     log.info("Extracted %d frames (sampled 1 per %d source frames)", saved, frame_interval)
-    return frames
+    return frames, video_fps
 
 
 # ---------------------------------------------------------------------------
@@ -292,40 +296,42 @@ def build_segments(groups: list[list[Frame]],
                    min_duration: float = MIN_SEGMENT_DURATION) -> list[Segment]:
     """
     Merge consecutive groups with identical text into final segments.
-    Each segment has start/end timestamp and the OCR'd text.
+    Stores both timestamp (seconds) and exact frame indices for audio cutting.
     """
     if not groups:
         return []
 
     segments: list[Segment] = []
-    flat: list[tuple[float, float, str]] = []  # (start, end, text)
+    flat: list[tuple[float, float, int, int, str]] = []  # (start_s, end_s, start_f, end_f, text)
 
     for group in groups:
-        start = group[0].timestamp
-        end = group[-1].timestamp
-        text = group[0].text.strip()
-        flat.append((start, end, text))
+        start_s = group[0].timestamp
+        end_s   = group[-1].timestamp
+        start_f = group[0].frame_index
+        end_f   = group[-1].frame_index
+        text    = group[0].text.strip()
+        flat.append((start_s, end_s, start_f, end_f, text))
 
     # Merge consecutive identical texts
-    merged_start, merged_end, merged_text = flat[0]
-    for start, end, text in flat[1:]:
-        if text == merged_text:
-            merged_end = end
+    ms, me, mfs, mfe, mt = flat[0]
+    for start_s, end_s, start_f, end_f, text in flat[1:]:
+        if text == mt:
+            me  = end_s
+            mfe = end_f
         else:
-            if merged_text and (merged_end - merged_start) >= min_duration:
+            if mt and (me - ms) >= min_duration:
                 segments.append(Segment(
-                    start=round(merged_start, 2),
-                    end=round(merged_end, 2),
-                    text=merged_text,
+                    start=round(ms, 3), end=round(me, 3),
+                    start_frame=mfs, end_frame=mfe,
+                    text=mt,
                 ))
-            merged_start, merged_end, merged_text = start, end, text
+            ms, me, mfs, mfe, mt = start_s, end_s, start_f, end_f, text
 
-    # Last segment
-    if merged_text and (merged_end - merged_start) >= min_duration:
+    if mt and (me - ms) >= min_duration:
         segments.append(Segment(
-            start=round(merged_start, 2),
-            end=round(merged_end, 2),
-            text=merged_text,
+            start=round(ms, 3), end=round(me, 3),
+            start_frame=mfs, end_frame=mfe,
+            text=mt,
         ))
 
     log.info("Built %d final segments", len(segments))
@@ -333,16 +339,54 @@ def build_segments(groups: list[list[Frame]],
 
 
 # ---------------------------------------------------------------------------
-# Output
+# Step 7 – Extract audio clips per segment
 # ---------------------------------------------------------------------------
+
+def extract_audio_segments(segments: list[Segment], video_path: Path,
+                            audio_dir: Path, video_fps: float) -> None:
+    """
+    Cut audio using exact frame indices → milliseconds (frame_index / video_fps * 1000).
+    This avoids rounding errors from float timestamp arithmetic.
+    """
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Loading audio track from video ...")
+
+    try:
+        full_audio = AudioSegment.from_file(str(video_path))
+    except Exception as e:
+        log.warning("pydub could not read audio: %s — skipping audio extraction", e)
+        return
+
+    log.info("Extracting %d audio clips (video_fps=%.3f) ...", len(segments), video_fps)
+    for i, seg in enumerate(segments):
+        # Convert frame index → ms with full float precision
+        start_ms = int(seg.start_frame / video_fps * 1000)
+        end_ms   = int(seg.end_frame   / video_fps * 1000)
+        end_ms   = min(end_ms, len(full_audio))
+        if start_ms >= end_ms:
+            continue
+        clip = full_audio[start_ms:end_ms]
+        out_path = audio_dir / f"segment_{i:04d}_f{seg.start_frame}-f{seg.end_frame}.wav"
+        clip.export(str(out_path), format="wav")
+        seg.audio_path = out_path
+        log.info("  [%d] frame %d–%d (%.3fs–%.3fs) → %s",
+                 i, seg.start_frame, seg.end_frame, seg.start, seg.end, out_path.name)
+
+    log.info("Audio extraction complete")
+
+
+
 
 def segments_to_json(segments: list[Segment], output_path: Path) -> None:
     data = [
         {
             "start": s.start,
             "end": s.end,
-            "duration": round(s.end - s.start, 2),
+            "duration": round(s.end - s.start, 3),
+            "start_frame": s.start_frame,
+            "end_frame": s.end_frame,
             "text": s.text,
+            "audio_file": str(s.audio_path) if s.audio_path else None,
         }
         for s in segments
     ]
@@ -358,6 +402,7 @@ def segments_to_json(segments: list[Segment], output_path: Path) -> None:
 def run_pipeline(
     youtube_url: str,
     output_json: str = "output.json",
+    audio_output_dir: Optional[str] = None,
     work_dir: Optional[str] = None,
     keep_temp: bool = False,
     fps: float = EXTRACT_FPS,
@@ -368,12 +413,15 @@ def run_pipeline(
     tmp.mkdir(parents=True, exist_ok=True)
     log.info("Working directory: %s", tmp)
 
+    # Audio clips go to a persistent directory (not temp) so they survive cleanup
+    audio_dir = Path(audio_output_dir) if audio_output_dir else Path(output_json).parent / "audio"
+
     try:
-        # 1. Download
+        # 1. Download (video + audio)
         video_path = download_video(youtube_url, tmp / "download")
 
         # 2. Extract frames
-        frames = extract_frames(video_path, tmp / "frames", fps=fps)
+        frames, video_fps = extract_frames(video_path, tmp / "frames", fps=fps)
         if not frames:
             raise RuntimeError("No frames extracted from video")
 
@@ -390,10 +438,14 @@ def run_pipeline(
         # 6. Build segments
         segments = build_segments(groups)
 
-        # 7. Save JSON
+        # 7. Extract audio clips (before cleanup!) using exact frame indices
+        extract_audio_segments(segments, video_path, audio_dir, video_fps)
+
+        # 8. Save JSON
         segments_to_json(segments, Path(output_json))
 
         log.info("✅ Done! Output: %s", output_json)
+        log.info("🔊 Audio clips: %s", audio_dir)
         return segments
 
     finally:
@@ -423,6 +475,8 @@ def main():
                         help=f"Bottom fraction of frame for subtitle crop (default: {SUBTITLE_REGION_FRACTION})")
     parser.add_argument("--hash-threshold", type=int, default=HASH_THRESHOLD,
                         help=f"Perceptual hash diff threshold (default: {HASH_THRESHOLD})")
+    parser.add_argument("--audio-dir", default=None,
+                        help="Directory to save audio clips (default: <output_dir>/audio/)")
     parser.add_argument("--vllm-url", default=None,
                         help="vLLM server base URL (overrides VLLM_BASE_URL env var)")
     parser.add_argument("--model", default=None,
@@ -440,6 +494,7 @@ def main():
     run_pipeline(
         youtube_url=args.url,
         output_json=args.output,
+        audio_output_dir=args.audio_dir,
         work_dir=args.work_dir,
         keep_temp=args.keep_temp,
         fps=args.fps,

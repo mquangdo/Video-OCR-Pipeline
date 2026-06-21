@@ -1,7 +1,6 @@
 services:
   vllm:
     image: vllm/vllm-openai:latest
-    runtime: nvidia
     ports:
       - "8000:8000"
     ipc: host
@@ -10,12 +9,12 @@ services:
     command: >
       --model Qwen/Qwen2.5-VL-3B-Instruct
       --dtype bfloat16
-      --max-model-len 2048
+      --max-model-len 1024
       --gpu-memory-utilization 0.3
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
