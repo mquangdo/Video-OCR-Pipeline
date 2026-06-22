@@ -34,11 +34,12 @@ def log_mem(tag: str):
 
 @dataclass
 class PlaylistItem:
-    index: int
-    title: str
-    video_path: str
+    index: int #thứ tự video trong playlist
+    title: str #tên video
+    video_path: str #đường dẫn file video trên disk (local)
 
 def normalized(text):
+    '''Chuẩn hoá text để so sánh: strip, bỏ newline, lowercase, nối dấu gạch ngang, bỏ dấu tiếng Việt (NFD decomposition + lọc category Mn)'''
     if text is None:
         return ""
 
@@ -55,9 +56,11 @@ def normalized(text):
 
 
 def similarity(a, b):
+    '''Tính tỉ lệ giống nhau giữa 2 chuỗi dùng difflib.SequenceMatcher.'''
     return SequenceMatcher(None, a, b).ratio()
 
 def is_similar_text(a, b, sim_threshold=0.85):
+    '''So sánh 2 chuỗi text sau khi chuẩn hoá, trả về True nếu similarity ≥ sim_threshold.'''
     na, nb = normalized(a), normalized(b)
     if na == "" and nb == "":
         return True
@@ -66,6 +69,7 @@ def is_similar_text(a, b, sim_threshold=0.85):
 
 
 def numpy_to_base64(img: np.ndarray) -> str:
+    '''Encode numpy array → Base64 string. Dùng để gửi ảnh trong LLM message.'''
     _, buffer = cv2.imencode(".png", img)
     img_bytes = buffer.tobytes()
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -73,6 +77,7 @@ def numpy_to_base64(img: np.ndarray) -> str:
 
 
 def get_llm(temperature=0.0):
+    '''Khởi tạo LangChain ChatOpenAI client kết nối đến vLLM server. Tắt SSL verify (httpx Client).'''
     client = Client(verify=False)
     return ChatOpenAI(
         model="Qwen/Qwen2.5-VL-3B-Instruct",
@@ -86,15 +91,19 @@ llm = get_llm()
 
 class VideoOCRProcessor:
     def __init__(self, video_path: str, crop=(100, 530, 1200, 680)):
-        self.video_path = video_path
-        self.crop = crop
-        self.vr = VideoReader(video_path, ctx=cpu(0))
+        '''Khởi tạo VideoReader (decord), tính total_frames, video_fps. Khởi tạo cache rỗng.'''
+        
+        self.video_path = video_path #đường dẫn video
+        self.crop = crop # vùng crop (x1, y1, x2, y2), mặc định (100, 530, 1200, 680) 
+        self.vr = VideoReader(video_path, ctx=cpu(0)) #decord VideoReader để đọc frame random-access
         self.total_frames = len(self.vr)
         self.video_fps = float(self.vr.get_avg_fps())
-        self.ocr_calls = 0
-        self.ocr_cache = {}
+        self.ocr_calls = 0 #số lần gọi OCR
+        self.ocr_cache = {} #cache kết quả OCR theo frame_time → tránh gọi lại
     
     def cleanup(self):
+        '''Xoá ocr_cache, giải phóng VideoReader. Được gọi tự động khi thoát context manager.'''
+        
         self.ocr_cache.clear()
         if hasattr(self, 'vr'):
             del self.vr
@@ -106,7 +115,14 @@ class VideoOCRProcessor:
         self.cleanup()
         return False
 
-    def read_frame(self, time_point: float):
+    def read_frame(self, time_point: float): 
+        '''
+        Đọc frame tại thời điểm (giây) từ video, crop région, trả về numpy array. Dùng decord random access vr[frame_index].
+        
+        Input: time_point (float — thời điểm giây)
+        Output: numpy array (frame đã crop) hoặc None nếu index ngoài range
+        '''
+        
         frame_index = int(time_point * self.video_fps) + 1
         frame_index = min(frame_index, self.total_frames - 1)
 
@@ -118,6 +134,14 @@ class VideoOCRProcessor:
         return frame[y1:y2, x1:x2]
 
     def ocr(self, frame_time: float):
+        '''
+        OCR 1 frame tại thời điểm cho trước. 
+        Kiểm tra cache trước, nếu chưa có → read_frame() → encode Base64 → gọi LLM (LangChain HumanMessage) → cache kết quả.
+        
+        Input: frame_time (float)
+        Output: str — text OCR
+        '''
+        
         if frame_time in self.ocr_cache:
             return self.ocr_cache[frame_time]
 
@@ -147,7 +171,15 @@ class VideoOCRProcessor:
         return text
 
     def binary_segmentation(self, left_time, right_time, left_text=None, right_text=None, threshold=0.5, sim_threshold=0.9):
-        """Phân đoạn nhị phân để tìm điểm chuyển text"""
+        '''
+        Thuật toán chia nhị phân đệ quy. 
+        So sánh text ở 2 điểm, nếu giống nhau → không có chuyển; nếu khác → chia đôi và đệ quy cho đến khi khoảng cách ≤ threshold (0.5s). 
+        Trả về list segment {"end": int, "text": str}.
+        
+        Input: left_time, right_time, left_text, right_text, threshold (0.5s), sim_threshold (0.9)
+        Output: list[dict] — danh sách điểm chuyển subtitle
+        '''
+        
         if left_text is None:
             left_text = self.ocr(left_time)
         if right_text is None:
@@ -168,7 +200,13 @@ class VideoOCRProcessor:
         )
 
     def scan_video(self, scan_step=4):
-        """Scan video để tìm tất cả timestamps thay đổi text"""
+        '''
+        Scan toàn bộ video. OCR tại mỗi scan_step giây (mặc định 4s). 
+        Khi phát hiện text khác với frame trước → gọi binary_segmentation() để tìm chính xác điểm chuyển.
+        Input: scan_step (int — bước nhảy scan, mặc định 4)
+        Output: list[dict] — tất cả điểm chuyển subtitle trong video
+        '''
+        
         video_duration = int(self.total_frames / self.video_fps)
         timestamps = []
 
@@ -190,7 +228,13 @@ class VideoOCRProcessor:
 
     @staticmethod
     def build_segments(timestamps):
-        """Xây dựng segments với start và end time"""
+        '''
+        Chuyển danh sách điểm chuyển thành segment có cả start và end. start của segment này = end của segment trước.
+        
+        Input: timestamps (list[dict] — output từ scan_video())
+        Output: list[dict] — segments {"start", "end", "text"}
+        '''
+        
         timestamps_with_start = []
         prev_end = 0.0
 
@@ -209,7 +253,7 @@ class VideoOCRProcessor:
 
 
 def serialize_segments(segments):
-    """Chuyển segments sang cấu trúc JSON-ready"""
+    '''Chuyển segments → list dict JSON-ready, thêm id cho mỗi segment.'''
     output = []
 
     for i, seg in enumerate(segments):
@@ -238,6 +282,13 @@ def save_segments_json(segments, json_output="segments.json"):
 
 
 def process_video_item(item: PlaylistItem, base_output_dir: str, scan_step: int = 4):
+    '''
+    Xử lý 1 PlaylistItem: tạo VideoOCRProcessor → scan → build segments → lưu JSON → trả thống kê (index, title, segment_count,
+    
+    Input: item (PlaylistItem), base_output_dir (str), scan_step (int)
+    Output: dict — kết quả xử lý
+    '''
+    
     video_path = Path(item.video_path)
     output_dir = Path(base_output_dir) / f"{item.index:03d}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -288,6 +339,15 @@ def process_playlist_items(
     start_index: int | None = None,
     end_index: int | None = None,
 ):
+    
+    '''
+    Xử lý batch nhiều video. Lọc theo index range, chia batch, chạy song song bằng ThreadPoolExecutor (mỗi batch có batch_size worker). 
+    Force GC sau mỗi batch. In thống kê từng batch + memory usage.
+    
+    Input: items (list[PlaylistItem]), base_output_dir, batch_size (4), scan_step (4), start_index, end_index
+    Output: list[dict] — kết quả sorted theo index
+    '''
+    
     os.makedirs(base_output_dir, exist_ok=True)
 
     filtered_items = [
