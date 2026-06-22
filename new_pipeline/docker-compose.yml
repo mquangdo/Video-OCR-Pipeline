@@ -16,5 +16,55 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              device_ids: ["0"]
               capabilities: [gpu]
+    networks:
+      - ocr-net
+
+  postgres:
+    image: postgres:16
+    container_name: video-ocr-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: video_ocr
+    ports:
+      - "5432:5432"          # bỏ dòng này nếu không cần truy cập DB từ máy host
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ocr-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: video-ocr-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123     # đổi password trước khi dùng thật
+    ports:
+      - "9000:9000"   # API (dùng cho pipeline kết nối)
+      - "9002:9002"   # Console web UI
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ocr-net
+
+networks:
+  ocr-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:

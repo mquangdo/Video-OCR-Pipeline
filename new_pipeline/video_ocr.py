@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Video Subtitle OCR Pipeline
+Video Subtitle OCR Pipeline (+ PostgreSQL persistence)
 - Download YouTube video (video + audio) via yt-dlp
 - Extract frames with OpenCV (no FFmpeg / sudo needed)
 - Crop subtitle region (bottom 28%)
@@ -8,6 +8,7 @@ Video Subtitle OCR Pipeline
 - OCR with Qwen 2.5 VL via vLLM (OpenAI-compatible API)
 - Extract audio clips per segment with pydub
 - Output JSON with timestamp + text + audio_file segments
+- Persist video status + segments into PostgreSQL (idempotent re-runs)
 """
 
 import os
@@ -18,7 +19,6 @@ import subprocess
 import argparse
 import logging
 import tempfile
-from io import BytesIO
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -29,6 +29,9 @@ from PIL import Image
 import imagehash
 from pydub import AudioSegment
 
+import db            # module: db.py (PostgreSQL)
+import minio_client  # module: minio_client.py (object storage cho audio)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -37,16 +40,9 @@ VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://192.168.1.100:8000")
 VLLM_MODEL    = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
 VLLM_API_KEY  = os.getenv("VLLM_API_KEY", "token-abc123")  # vLLM default
 
-# Fraction of frame height to crop as subtitle region (bottom portion)
 SUBTITLE_REGION_FRACTION = 0.28
-
-# Frame extraction rate (frames per second)
 EXTRACT_FPS = 1.0
-
-# Perceptual hash distance threshold (0 = identical, higher = more tolerant)
 HASH_THRESHOLD = 4
-
-# Minimum segment duration in seconds to include in output
 MIN_SEGMENT_DURATION = 0.5
 
 logging.basicConfig(
@@ -63,8 +59,8 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Frame:
-    timestamp: float          # seconds (for display/JSON)
-    frame_index: int          # source frame number in original video
+    timestamp: float
+    frame_index: int
     path: Path
     crop_path: Optional[Path] = None
     text: str = ""
@@ -72,9 +68,9 @@ class Frame:
 
 @dataclass
 class Segment:
-    start: float              # seconds (for display/JSON)
+    start: float
     end: float
-    start_frame: int          # exact source frame index
+    start_frame: int
     end_frame: int
     text: str
     audio_path: Optional[Path] = None
@@ -85,7 +81,6 @@ class Segment:
 # ---------------------------------------------------------------------------
 
 def download_video(url: str, output_dir: Path) -> Path:
-    """Download best video with audio via yt-dlp."""
     log.info("Downloading video: %s", url)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_template = str(output_dir / "video.%(ext)s")
@@ -107,14 +102,10 @@ def download_video(url: str, output_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Step 2 – Extract frames with OpenCV (no FFmpeg / sudo needed)
+# Step 2 – Extract frames with OpenCV
 # ---------------------------------------------------------------------------
 
 def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS) -> tuple[list[Frame], float]:
-    """
-    Extract frames at the given FPS using OpenCV.
-    Returns (list of Frame objects, video_fps) — video_fps needed for precise audio cutting.
-    """
     frames_dir.mkdir(parents=True, exist_ok=True)
     log.info("Extracting frames at %.2f fps via OpenCV ...", fps)
 
@@ -147,7 +138,6 @@ def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS)
             pil_img = Image.fromarray(rgb)
             pil_img.save(out_path, "JPEG", quality=92)
 
-            # Store actual source frame index for precise audio cutting
             frames.append(Frame(timestamp=timestamp, frame_index=frame_idx, path=out_path))
             saved += 1
 
@@ -164,7 +154,6 @@ def extract_frames(video_path: Path, frames_dir: Path, fps: float = EXTRACT_FPS)
 
 def crop_subtitle_region(frames: list[Frame], crop_dir: Path,
                           fraction: float = SUBTITLE_REGION_FRACTION) -> None:
-    """Crop bottom `fraction` of each frame. Sets crop_path on each Frame."""
     crop_dir.mkdir(parents=True, exist_ok=True)
     for frame in frames:
         img = Image.open(frame.path)
@@ -183,7 +172,6 @@ def crop_subtitle_region(frames: list[Frame], crop_dir: Path,
 # ---------------------------------------------------------------------------
 
 def compute_phashes(frames: list[Frame]) -> None:
-    """Compute perceptual hash for each cropped frame."""
     for frame in frames:
         img = Image.open(frame.crop_path)
         frame.phash = str(imagehash.phash(img))
@@ -191,10 +179,6 @@ def compute_phashes(frames: list[Frame]) -> None:
 
 def group_by_unique_subtitle(frames: list[Frame],
                               threshold: int = HASH_THRESHOLD) -> list[list[Frame]]:
-    """
-    Group consecutive frames that share the same subtitle image (similar hash).
-    Returns list of groups; each group = same subtitle segment.
-    """
     if not frames:
         return []
 
@@ -227,7 +211,6 @@ def image_to_base64(path: Path) -> str:
 
 
 def ocr_frame(image_path: Path, session: requests.Session) -> str:
-    """Send a cropped frame to Qwen VL for OCR. Returns extracted text."""
     b64 = image_to_base64(image_path)
     payload = {
         "model": VLLM_MODEL,
@@ -239,9 +222,7 @@ def ocr_frame(image_path: Path, session: requests.Session) -> str:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}"
-                        },
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                     },
                     {
                         "type": "text",
@@ -271,11 +252,9 @@ def ocr_frame(image_path: Path, session: requests.Session) -> str:
 
 
 def ocr_groups(groups: list[list[Frame]]) -> None:
-    """OCR the middle frame of each group and assign text to all frames."""
     session = requests.Session()
     total = len(groups)
     for i, group in enumerate(groups, 1):
-        # Pick middle frame as representative
         rep_frame = group[len(group) // 2]
         log.info("[%d/%d] OCR frame @ %.2fs ...", i, total, rep_frame.timestamp)
         try:
@@ -294,15 +273,11 @@ def ocr_groups(groups: list[list[Frame]]) -> None:
 
 def build_segments(groups: list[list[Frame]],
                    min_duration: float = MIN_SEGMENT_DURATION) -> list[Segment]:
-    """
-    Merge consecutive groups with identical text into final segments.
-    Stores both timestamp (seconds) and exact frame indices for audio cutting.
-    """
     if not groups:
         return []
 
     segments: list[Segment] = []
-    flat: list[tuple[float, float, int, int, str]] = []  # (start_s, end_s, start_f, end_f, text)
+    flat: list[tuple[float, float, int, int, str]] = []
 
     for group in groups:
         start_s = group[0].timestamp
@@ -312,7 +287,6 @@ def build_segments(groups: list[list[Frame]],
         text    = group[0].text.strip()
         flat.append((start_s, end_s, start_f, end_f, text))
 
-    # Merge consecutive identical texts
     ms, me, mfs, mfe, mt = flat[0]
     for start_s, end_s, start_f, end_f, text in flat[1:]:
         if text == mt:
@@ -343,10 +317,14 @@ def build_segments(groups: list[list[Frame]],
 # ---------------------------------------------------------------------------
 
 def extract_audio_segments(segments: list[Segment], video_path: Path,
-                            audio_dir: Path, video_fps: float) -> None:
+                            audio_dir: Path, video_fps: float,
+                            video_id: Optional[int] = None,
+                            use_minio: bool = True) -> None:
     """
     Cut audio using exact frame indices → milliseconds (frame_index / video_fps * 1000).
-    This avoids rounding errors from float timestamp arithmetic.
+    Nếu use_minio=True: upload mỗi clip lên MinIO rồi xoá file local, seg.audio_path
+    sẽ lưu object_name (key trong bucket) thay vì path local.
+    Nếu upload lỗi (MinIO down...): tự fallback giữ file local, không làm crash pipeline.
     """
     audio_dir.mkdir(parents=True, exist_ok=True)
     log.info("Loading audio track from video ...")
@@ -357,9 +335,15 @@ def extract_audio_segments(segments: list[Segment], video_path: Path,
         log.warning("pydub could not read audio: %s — skipping audio extraction", e)
         return
 
+    if use_minio:
+        try:
+            minio_client.ensure_bucket()
+        except Exception as e:
+            log.warning("Không kết nối được MinIO (%s) — toàn bộ audio sẽ lưu local", e)
+            use_minio = False
+
     log.info("Extracting %d audio clips (video_fps=%.3f) ...", len(segments), video_fps)
     for i, seg in enumerate(segments):
-        # Convert frame index → ms with full float precision
         start_ms = int(seg.start_frame / video_fps * 1000)
         end_ms   = int(seg.end_frame   / video_fps * 1000)
         end_ms   = min(end_ms, len(full_audio))
@@ -368,16 +352,28 @@ def extract_audio_segments(segments: list[Segment], video_path: Path,
         clip = full_audio[start_ms:end_ms]
         out_path = audio_dir / f"segment_{i:04d}_f{seg.start_frame}-f{seg.end_frame}.wav"
         clip.export(str(out_path), format="wav")
-        seg.audio_path = out_path
+
+        if use_minio:
+            prefix = f"video_{video_id}" if video_id is not None else "unknown_video"
+            object_name = f"{prefix}/{out_path.name}"
+            try:
+                minio_client.upload_file(out_path, object_name)
+                out_path.unlink()  # MinIO là nguồn lưu chính, xoá bản local để khỏi trùng
+                seg.audio_path = object_name
+            except Exception as e:
+                log.warning("Upload MinIO thất bại cho %s: %s — giữ file local", out_path.name, e)
+                seg.audio_path = out_path
+        else:
+            seg.audio_path = out_path
+
         log.info("  [%d] frame %d–%d (%.3fs–%.3fs) → %s",
-                 i, seg.start_frame, seg.end_frame, seg.start, seg.end, out_path.name)
+                 i, seg.start_frame, seg.end_frame, seg.start, seg.end, seg.audio_path)
 
     log.info("Audio extraction complete")
 
 
-
-
-def segments_to_json(segments: list[Segment], output_path: Path) -> None:
+def segments_to_json(segments: list[Segment], output_path: Path) -> list[dict]:
+    """Lưu segments ra JSON, trả về list dict để dùng tiếp (insert DB)."""
     data = [
         {
             "start": s.start,
@@ -393,6 +389,7 @@ def segments_to_json(segments: list[Segment], output_path: Path) -> None:
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     log.info("Saved %d segments → %s", len(segments), output_path)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -408,45 +405,79 @@ def run_pipeline(
     fps: float = EXTRACT_FPS,
     subtitle_fraction: float = SUBTITLE_REGION_FRACTION,
     hash_threshold: int = HASH_THRESHOLD,
+    force: bool = False,
+    use_minio: bool = True,
 ):
+    # --- DB: idempotency ---------------------------------------------------
+    video_row = db.create_or_get_video(youtube_url)
+    video_id = video_row["id"]
+
+    if video_row["status"] == "done" and not force:
+        log.info(
+            "Video đã xử lý xong trước đó (id=%s, status=done) → bỏ qua. "
+            "Dùng --force nếu muốn xử lý lại.",
+            video_id,
+        )
+        return None
+
+    if force and video_row["status"] != "pending":
+        db.reset_video_for_reprocess(video_id)
+
     tmp = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="ocr_"))
     tmp.mkdir(parents=True, exist_ok=True)
     log.info("Working directory: %s", tmp)
 
-    # Audio clips go to a persistent directory (not temp) so they survive cleanup
     audio_dir = Path(audio_output_dir) if audio_output_dir else Path(output_json).parent / "audio"
 
     try:
-        # 1. Download (video + audio)
+        # 1. Download
+        db.update_video_status(video_id, "downloading")
         video_path = download_video(youtube_url, tmp / "download")
+        db.update_video_status(video_id, "downloading", video_path=str(video_path))
 
         # 2. Extract frames
+        db.update_video_status(video_id, "extracting")
         frames, video_fps = extract_frames(video_path, tmp / "frames", fps=fps)
         if not frames:
             raise RuntimeError("No frames extracted from video")
+        duration = frames[-1].timestamp
+        db.update_video_status(video_id, "extracting", video_fps=video_fps, duration=duration)
 
         # 3. Crop subtitle region
         crop_subtitle_region(frames, tmp / "crops", fraction=subtitle_fraction)
 
-        # 4. Compute perceptual hashes & group
+        # 4. Hash & group
         compute_phashes(frames)
         groups = group_by_unique_subtitle(frames, threshold=hash_threshold)
 
         # 5. OCR
+        db.update_video_status(video_id, "ocr_processing")
         ocr_groups(groups)
 
         # 6. Build segments
         segments = build_segments(groups)
 
-        # 7. Extract audio clips (before cleanup!) using exact frame indices
-        extract_audio_segments(segments, video_path, audio_dir, video_fps)
+        # 7. Audio clips (trước khi cleanup!)
+        db.update_video_status(video_id, "audio_extracting")
+        extract_audio_segments(segments, video_path, audio_dir, video_fps,
+                                video_id=video_id, use_minio=use_minio)
 
-        # 8. Save JSON
-        segments_to_json(segments, Path(output_json))
+        # 8. Lưu JSON
+        segments_data = segments_to_json(segments, Path(output_json))
+
+        # --- DB: persist segments ------------------------------------------
+        db.delete_segments_for_video(video_id)  # an toàn khi re-run
+        db.insert_segments(video_id, segments_data)
+        db.update_video_status(video_id, "done")
 
         log.info("✅ Done! Output: %s", output_json)
         log.info("🔊 Audio clips: %s", audio_dir)
         return segments
+
+    except Exception as e:
+        db.update_video_status(video_id, "failed", error_message=str(e))
+        log.error("❌ Pipeline failed (video_id=%s): %s", video_id, e)
+        raise
 
     finally:
         if not keep_temp:
@@ -460,7 +491,7 @@ def run_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YouTube Video Subtitle OCR Pipeline using Qwen 2.5 VL"
+        description="YouTube Video Subtitle OCR Pipeline using Qwen 2.5 VL (+ PostgreSQL)"
     )
     parser.add_argument("url", help="YouTube video URL")
     parser.add_argument("-o", "--output", default="output.json",
@@ -481,6 +512,12 @@ def main():
                         help="vLLM server base URL (overrides VLLM_BASE_URL env var)")
     parser.add_argument("--model", default=None,
                         help="Model name (overrides VLLM_MODEL env var)")
+    parser.add_argument("--force", action="store_true",
+                        help="Xử lý lại video dù đã có status='done' trong DB")
+    parser.add_argument("--no-minio", action="store_true",
+                        help="Không upload audio lên MinIO, chỉ lưu local disk")
+    parser.add_argument("--no-db-init", action="store_true",
+                        help="Bỏ qua bước tự tạo schema (dùng khi schema đã được setup sẵn)")
 
     args = parser.parse_args()
 
@@ -491,6 +528,9 @@ def main():
         global VLLM_MODEL
         VLLM_MODEL = args.model
 
+    if not args.no_db_init:
+        db.init_schema()
+
     run_pipeline(
         youtube_url=args.url,
         output_json=args.output,
@@ -500,6 +540,8 @@ def main():
         fps=args.fps,
         subtitle_fraction=args.subtitle_fraction,
         hash_threshold=args.hash_threshold,
+        force=args.force,
+        use_minio=not args.no_minio,
     )
 
 
