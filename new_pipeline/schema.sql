@@ -1,41 +1,37 @@
--- ============================================================================
--- Schema: Video OCR Pipeline
--- ============================================================================
+-- ============================================================
+-- Crawl Pipeline Schema
+-- ============================================================
 
-CREATE TABLE IF NOT EXISTS videos (
+CREATE TABLE IF NOT EXISTS crawl_status (
     id              SERIAL PRIMARY KEY,
-    youtube_url     TEXT UNIQUE NOT NULL,
-    title           TEXT,
-    video_path      TEXT,
+
+    -- Identity
+    video_id        TEXT NOT NULL UNIQUE,   -- YouTube video ID, e.g. "dQw4w9WgXcQ"
+    url             TEXT NOT NULL,
+
+    -- Playlist context
+    playlist_url    TEXT,
+    playlist_index  INTEGER,                -- index trong playlist (0-based)
+
+    -- Processing state
     status          TEXT NOT NULL DEFAULT 'pending',
-    -- status: pending -> downloading -> extracting -> ocr_processing
-    --         -> audio_extracting -> done | failed
+    -- pending | processing | done | failed
+
+    -- Output location
+    output_dir      TEXT,                   -- path tới folder crawled_data/<video_id>/
+    segment_count   INTEGER,                -- số segment sau khi OCR xong
+    total_duration  FLOAT,                  -- tổng duration (giây) của toàn bộ segment
+
+    -- Error tracking
     error_message   TEXT,
-    video_fps       REAL,
-    duration        REAL,
-    created_at      TIMESTAMP NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMP NOT NULL DEFAULT now()
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,            -- lúc bắt đầu xử lý
+    finished_at     TIMESTAMPTZ             -- lúc done hoặc failed
 );
 
-CREATE TABLE IF NOT EXISTS segments (
-    id              SERIAL PRIMARY KEY,
-    video_id        INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-    start_time      REAL NOT NULL,
-    end_time        REAL NOT NULL,
-    duration        REAL,
-    start_frame     INTEGER,
-    end_frame       INTEGER,
-    text            TEXT,
-    audio_file      TEXT,
-    created_at      TIMESTAMP NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_segments_video_id ON segments(video_id);
-
--- Full-text search trên nội dung subtitle (tiếng Việt nên dùng config 'simple'
--- vì Postgres không có dictionary tiếng Việt built-in; nếu cần stemming tiếng
--- Việt tốt hơn, xem xét extension pg_jieba/unaccent kết hợp).
-CREATE INDEX IF NOT EXISTS idx_segments_text_fts
-    ON segments USING GIN (to_tsvector('simple', coalesce(text, '')));
-
-CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
+-- Index thường dùng
+CREATE INDEX IF NOT EXISTS idx_crawl_status_status   ON crawl_status (status);
+CREATE INDEX IF NOT EXISTS idx_crawl_status_playlist ON crawl_status (playlist_url);
