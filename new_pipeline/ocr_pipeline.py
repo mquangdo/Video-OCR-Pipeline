@@ -40,14 +40,17 @@ import crawl_db
 # Config
 # ---------------------------------------------------------------------------
 
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://192.168.1.100:8000")
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http:localhost:8000")
 VLLM_MODEL    = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
 VLLM_API_KEY  = os.getenv("VLLM_API_KEY", "token-abc123")
 
-SUBTITLE_REGION_FRACTION = 0.28
-EXTRACT_FPS              = 1.0
-HASH_THRESHOLD           = 5
-MIN_SEGMENT_DURATION     = 0.5
+# Vùng crop subtitle, dạng tỉ lệ tương đối (x1, y1, x2, y2), mỗi giá trị trong [0, 1].
+# (0, 0) là góc trên-trái, (1, 1) là góc dưới-phải của frame.
+# Mặc định: dải ngang full chiều rộng, nằm ở 72%-100% chiều cao (tương đương crop 28% đáy cũ).
+SUBTITLE_REGION           = (0.0, 0.72, 1.0, 1.0)
+EXTRACT_FPS               = 1.0
+HASH_THRESHOLD            = 5
+MIN_SEGMENT_DURATION      = 0.5
 
 OUTPUT_ROOT = Path("crawled_data")
 
@@ -202,16 +205,36 @@ def extract_frames_generator(video_path: Path, frames_dir: Path, fps: float = EX
 # ---------------------------------------------------------------------------
 
 def crop_subtitle_region(frames: list[Frame], crop_dir: Path,
-                          fraction: float = SUBTITLE_REGION_FRACTION) -> None:
+                          region: tuple[float, float, float, float] = SUBTITLE_REGION) -> None:
+    """
+    Crop vùng subtitle theo box (x1, y1, x2, y2).
+
+    Mỗi tọa độ là tỉ lệ tương đối trong [0, 1] so với chiều rộng/cao của frame:
+        x1, x2 : tỉ lệ theo chiều ngang (trái -> phải)
+        y1, y2 : tỉ lệ theo chiều dọc   (trên -> dưới)
+
+    Ví dụ: region=(0.0, 0.72, 1.0, 1.0) nghĩa là lấy full chiều rộng,
+    từ 72% đến 100% chiều cao (dải đáy của frame).
+    """
+    x1, y1, x2, y2 = region
+    if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+        raise ValueError(f"region không hợp lệ: {region} (cần 0<=x1<x2<=1 và 0<=y1<y2<=1)")
+
     crop_dir.mkdir(parents=True, exist_ok=True)
     for frame in frames:
-        img     = Image.open(frame.path)
-        w, h    = img.size
-        cropped = img.crop((0, int(h * (1 - fraction)), w, h))
+        img  = Image.open(frame.path)
+        w, h = img.size
+        box = (
+            int(w * x1),
+            int(h * y1),
+            int(w * x2),
+            int(h * y2),
+        )
+        cropped = img.crop(box)
         crop_path = crop_dir / frame.path.name
         cropped.save(crop_path, "JPEG", quality=90)
         frame.crop_path = crop_path
-    log.info("Cropped bottom %.0f%% for %d frames", fraction * 100, len(frames))
+    log.info("Cropped region %s for %d frames", region, len(frames))
 
 
 # ---------------------------------------------------------------------------
@@ -390,11 +413,11 @@ def save_segments_json(segments: list[Segment], output_path: Path) -> None:
 def process_video(
     entry: "VideoEntry",
     video_out_dir: Path,
-    playlist_url: Optional[str]  = None,
-    fps: float                   = EXTRACT_FPS,
-    subtitle_fraction: float     = SUBTITLE_REGION_FRACTION,
-    hash_threshold: int          = HASH_THRESHOLD,
-    keep_temp: bool              = False,
+    playlist_url: Optional[str]                       = None,
+    fps: float                                         = EXTRACT_FPS,
+    subtitle_region: tuple[float, float, float, float] = SUBTITLE_REGION,
+    hash_threshold: int                                = HASH_THRESHOLD,
+    keep_temp: bool                                    = False,
 ) -> bool:
     """
     Xử lý 1 video. Trả về True nếu thành công, False nếu lỗi.
@@ -455,7 +478,7 @@ def process_video(
         video_fps = get_video_fps(video_path)
 
         # 3. Crop
-        crop_subtitle_region(frames, tmp / "crops", fraction=subtitle_fraction)
+        crop_subtitle_region(frames, tmp / "crops", region=subtitle_region)
 
         # 4. Hash & group
         compute_phashes(frames)
@@ -505,11 +528,11 @@ def run(
     entries: list[VideoEntry],
     start_index: int,
     end_index: int,
-    output_root: Path        = OUTPUT_ROOT,
-    fps: float               = EXTRACT_FPS,
-    subtitle_fraction: float = SUBTITLE_REGION_FRACTION,
-    hash_threshold: int      = HASH_THRESHOLD,
-    keep_temp: bool          = False,
+    output_root: Path                                  = OUTPUT_ROOT,
+    fps: float                                          = EXTRACT_FPS,
+    subtitle_region: tuple[float, float, float, float]  = SUBTITLE_REGION,
+    hash_threshold: int                                 = HASH_THRESHOLD,
+    keep_temp: bool                                     = False,
 ):
     if start_index < 0 or end_index >= len(entries) or start_index > end_index:
         raise ValueError(
@@ -557,7 +580,7 @@ def run(
             video_out_dir     = video_out_dir,
             playlist_url      = playlist_url,
             fps               = fps,
-            subtitle_fraction = subtitle_fraction,
+            subtitle_region   = subtitle_region,
             hash_threshold    = hash_threshold,
             keep_temp         = keep_temp,
         )
@@ -596,8 +619,11 @@ def main():
                         help=f"Thư mục output (mặc định: {OUTPUT_ROOT})")
     parser.add_argument("--fps", type=float, default=EXTRACT_FPS,
                         help=f"Frame extraction rate (mặc định: {EXTRACT_FPS})")
-    parser.add_argument("--subtitle-fraction", type=float, default=SUBTITLE_REGION_FRACTION,
-                        help=f"Tỉ lệ crop subtitle (mặc định: {SUBTITLE_REGION_FRACTION})")
+    parser.add_argument("--subtitle-region", type=float, nargs=4,
+                        default=list(SUBTITLE_REGION),
+                        metavar=("X1", "Y1", "X2", "Y2"),
+                        help="Vùng crop subtitle theo tỉ lệ tương đối x1 y1 x2 y2, "
+                             f"mỗi giá trị trong [0,1] (mặc định: {SUBTITLE_REGION})")
     parser.add_argument("--hash-threshold", type=int, default=HASH_THRESHOLD,
                         help=f"Perceptual hash threshold (mặc định: {HASH_THRESHOLD})")
     parser.add_argument("--keep-temp", action="store_true",
@@ -630,7 +656,7 @@ def main():
         end_index         = end_index,
         output_root       = Path(args.output_dir),
         fps               = args.fps,
-        subtitle_fraction = args.subtitle_fraction,
+        subtitle_region   = tuple(args.subtitle_region),
         hash_threshold    = args.hash_threshold,
         keep_temp         = args.keep_temp,
     )
